@@ -10,8 +10,10 @@ import requests
 from jusho import Jusho
 
 app = Flask(__name__)
-app.config["UPLOAD_FOLDER"] = os.path.join(os.path.dirname(__file__), "uploads")
-app.config["RESULT_FOLDER"] = os.path.join(os.path.dirname(__file__), "results")
+_base_dir = os.environ.get("RENDER", None)
+_data_root = "/tmp" if _base_dir is not None else os.path.dirname(__file__)
+app.config["UPLOAD_FOLDER"] = os.path.join(_data_root, "uploads")
+app.config["RESULT_FOLDER"] = os.path.join(_data_root, "results")
 app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024  # 16MB
 
 os.makedirs(app.config["UPLOAD_FOLDER"], exist_ok=True)
@@ -259,4 +261,4 @@ def download(job_id):
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=True)
