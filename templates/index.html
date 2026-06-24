@@ -194,7 +194,7 @@
     <div class="container">
         <h1>学校住所チェッカー</h1>
         <p class="subtitle">
-            Excelファイルをアップロードすると、学校名と住所をAPIで照合・補完します。
+            Excelファイルをアップロードすると、住所から郵便番号を逆引きして照合します。
         </p>
 
         <div class="info-box">
@@ -203,8 +203,7 @@
             <strong>出力:</strong><br>
             B列: 学校名 ／ C列: 郵便番号（元データ） ／
             D列: <span class="tag tag-blue">郵便番号（住所から逆引き）</span> ／
-            E列: 住所（元データ） ／
-            F列: <span class="tag tag-green">住所（学校名APIから取得）</span>
+            E列: 住所（元データ）
         </div>
 
         <div class="upload-area" id="uploadArea">
