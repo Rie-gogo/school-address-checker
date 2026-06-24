@@ -6,7 +6,6 @@ import re
 
 from flask import Flask, request, jsonify, send_file, render_template
 import openpyxl
-import requests
 from jusho import Jusho
 
 app = Flask(__name__)
@@ -23,25 +22,6 @@ os.makedirs(app.config["RESULT_FOLDER"], exist_ok=True)
 jobs = {}
 
 # jusho DB will be created per-thread to avoid SQLite threading issues
-
-SCHOOL_API_URL = "https://school.teraren.com/schools.json"
-
-KANJI_NORMALIZE = {
-    "鷗": "鴎", "國": "国", "學": "学", "藝": "芸", "櫻": "桜",
-    "澤": "沢", "邊": "辺", "齋": "斎", "齊": "斉", "廣": "広",
-    "髙": "高", "﨑": "崎",
-}
-
-
-def normalize_school_name(name):
-    if not name:
-        return name
-    result = name
-    result = result.replace("\uFF0D", "\u30FC")
-    result = result.replace("－", "ー")
-    for old, new in KANJI_NORMALIZE.items():
-        result = result.replace(old, new)
-    return result
 
 
 WARD_REMAP = {
@@ -155,65 +135,6 @@ def address_to_zipcode(address, jusho_db):
     return ""
 
 
-def get_school_address(school_name, original_zipcode=None, original_address=None):
-    if not school_name:
-        return ""
-
-    normalized = normalize_school_name(school_name)
-    search_terms = []
-
-    if school_name != normalized:
-        search_terms.append(school_name)
-
-    search_terms.append(normalized)
-
-    if normalized != school_name:
-        half_normalized = school_name.replace("\uFF0D", "\u30FC").replace("－", "ー")
-        if half_normalized != normalized and half_normalized != school_name:
-            search_terms.append(half_normalized)
-
-    if " " in normalized or "\u3000" in normalized:
-        parts = re.split(r"[ \u3000]+", normalized)
-        search_terms.append(parts[-1])
-
-    short = re.sub(r"(高等学校|高等部|中学校高等学校|中等教育学校)$", "", normalized)
-    if short != normalized:
-        search_terms.append(short)
-
-    no_suffix = re.sub(r"[・].*$", "", normalized)
-    if no_suffix != normalized and len(no_suffix) >= 3:
-        search_terms.append(no_suffix)
-
-    no_campus = re.sub(r"(?:校舎|キャンパス)$", "", normalized)
-    if no_campus != normalized:
-        search_terms.append(no_campus)
-
-    original_pref = ""
-    if original_address:
-        pm = re.match(r"^(東京都|北海道|(?:京都|大阪)府|.{2,3}県)", original_address)
-        if pm:
-            original_pref = pm.group(1)
-
-    for term in search_terms:
-        try:
-            r = requests.get(SCHOOL_API_URL, params={"s": term}, timeout=10)
-            results = r.json()
-            if not results:
-                continue
-            if original_zipcode is not None:
-                zip_str = str(int(original_zipcode)).zfill(7)
-                for s in results:
-                    if s.get("postal_code") == zip_str:
-                        return s.get("location", "")
-            if original_pref:
-                for s in results:
-                    if s.get("location", "").startswith(original_pref):
-                        return s.get("location", "")
-            return results[0].get("location", "")
-        except Exception:
-            continue
-    return ""
-
 
 def process_excel(job_id, input_path, output_path):
     try:
@@ -228,7 +149,6 @@ def process_excel(job_id, input_path, output_path):
         ws["C1"] = "郵便番号（元データ）"
         ws["D1"] = "郵便番号（住所から逆引き）"
         ws["E1"] = "住所（元データ）"
-        ws["F1"] = "住所（学校名APIから取得）"
 
         total = ws.max_row - 1
         jobs[job_id]["total"] = total
@@ -239,15 +159,12 @@ def process_excel(job_id, input_path, output_path):
             original_address = ws.cell(row=row_idx, column=4).value
 
             reverse_zipcode = address_to_zipcode(original_address, thread_jusho)
-            school_address = get_school_address(school_name, zipcode, original_address)
 
             ws.cell(row=row_idx, column=4).value = reverse_zipcode
             ws.cell(row=row_idx, column=5).value = original_address
-            ws.cell(row=row_idx, column=6).value = school_address
 
             jobs[job_id]["progress"] = row_idx - 1
             jobs[job_id]["current_school"] = school_name or ""
-            time.sleep(0.3)
 
         wb.save(output_path)
         jobs[job_id]["status"] = "done"
