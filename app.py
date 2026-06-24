@@ -44,6 +44,56 @@ def normalize_school_name(name):
     return result
 
 
+WARD_REMAP = {
+    "浜松市中央区": ["浜松市中区", "浜松市東区", "浜松市南区"],
+    "浜松市浜名区": ["浜松市西区", "浜松市北区", "浜松市浜北区"],
+}
+
+
+def _search_with_city_match(town_clean, pref, city, jusho_db):
+    results = jusho_db.search_addresses(town_clean)
+    city_variants = [city]
+    for new_ward, old_wards in WARD_REMAP.items():
+        if city == new_ward:
+            city_variants.extend(old_wards)
+            break
+
+    exact_match = None
+    sonota_match = None
+    best_match = None
+    for r in results:
+        addr_str = str(r)
+        if pref not in addr_str:
+            continue
+        city_matched = False
+        for cv in city_variants:
+            if cv in addr_str:
+                city_matched = True
+                break
+        if not city_matched:
+            city_parts = re.findall(r"[^市区町村郡]+[市区町村]", city)
+            if city_parts and all(part in addr_str for part in city_parts):
+                city_matched = True
+        if not city_matched:
+            continue
+        zm = re.search(r"〒(\d{3}-\d{4})", addr_str)
+        if not zm:
+            continue
+        zipcode = zm.group(1).replace("-", "")
+        is_exact = (f" {town_clean}(" in addr_str or f" {town_clean}\uff08" in addr_str
+                    or addr_str.endswith(f" {town_clean}"))
+        if is_exact:
+            if "\uff08\u305d\u306e\u4ed6\uff09" in addr_str:
+                sonota_match = zipcode
+            elif f" {town_clean}(" in addr_str or addr_str.endswith(f" {town_clean}"):
+                if exact_match is None:
+                    exact_match = zipcode
+        if best_match is None:
+            best_match = zipcode
+
+    return exact_match or sonota_match or best_match
+
+
 def address_to_zipcode(address, jusho_db):
     if not address:
         return ""
@@ -84,30 +134,24 @@ def address_to_zipcode(address, jusho_db):
 
             town_clean = town_clean.replace("\u30F6", "\u30B1").replace("\u30F5", "\u30AB")
 
-            results = jusho_db.search_addresses(town_clean)
-            best_match = None
-            for r in results:
-                addr_str = str(r)
-                if pref not in addr_str:
+            town_variants = [town_clean]
+            aza_split = re.split(r"字", town_clean)
+            if len(aza_split) > 1 and aza_split[0]:
+                town_variants.append(aza_split[0])
+            machi_match = re.match(r"^(.+?町)", town_clean)
+            if machi_match and machi_match.group(1) != town_clean:
+                town_variants.append(machi_match.group(1))
+            if len(town_clean) > 3:
+                town_variants.append(town_clean[:len(town_clean) * 2 // 3])
+
+            seen = set()
+            for tv in town_variants:
+                if tv in seen or not tv:
                     continue
-                city_matched = False
-                if city in addr_str:
-                    city_matched = True
-                else:
-                    city_parts = re.findall(r"[^市区町村郡]+[市区町村]", city)
-                    if city_parts and all(part in addr_str for part in city_parts):
-                        city_matched = True
-                if not city_matched:
-                    continue
-                zm = re.search(r"〒(\d{3}-\d{4})", addr_str)
-                if zm:
-                    zipcode = zm.group(1).replace("-", "")
-                    if town_clean + "(" in addr_str or f" {town_clean}" in addr_str:
-                        return zipcode
-                    if best_match is None:
-                        best_match = zipcode
-            if best_match:
-                return best_match
+                seen.add(tv)
+                result = _search_with_city_match(tv, pref, city, jusho_db)
+                if result:
+                    return result
     return ""
 
 
