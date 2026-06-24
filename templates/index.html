@@ -1,0 +1,382 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>学校住所チェッカー</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Segoe UI', 'Hiragino Sans', 'Noto Sans JP', sans-serif;
+            background: #f0f2f5;
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: flex-start;
+            padding: 40px 20px;
+        }
+        .container {
+            background: #fff;
+            border-radius: 16px;
+            box-shadow: 0 2px 16px rgba(0,0,0,0.08);
+            padding: 40px;
+            max-width: 640px;
+            width: 100%;
+        }
+        h1 {
+            font-size: 1.5rem;
+            color: #1a1a2e;
+            margin-bottom: 8px;
+        }
+        .subtitle {
+            color: #666;
+            font-size: 0.9rem;
+            margin-bottom: 32px;
+            line-height: 1.6;
+        }
+        .upload-area {
+            border: 2px dashed #ccc;
+            border-radius: 12px;
+            padding: 40px;
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.2s;
+            margin-bottom: 24px;
+        }
+        .upload-area:hover, .upload-area.dragover {
+            border-color: #4a6cf7;
+            background: #f8f9ff;
+        }
+        .upload-area.has-file {
+            border-color: #22c55e;
+            background: #f0fdf4;
+        }
+        .upload-icon {
+            font-size: 3rem;
+            margin-bottom: 12px;
+        }
+        .upload-text {
+            color: #666;
+            font-size: 0.95rem;
+        }
+        .upload-text strong {
+            color: #4a6cf7;
+        }
+        .file-name {
+            color: #22c55e;
+            font-weight: 600;
+            font-size: 0.95rem;
+            margin-top: 8px;
+        }
+        #fileInput { display: none; }
+        .btn {
+            display: inline-block;
+            padding: 14px 32px;
+            border: none;
+            border-radius: 8px;
+            font-size: 1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+            width: 100%;
+        }
+        .btn-primary {
+            background: #4a6cf7;
+            color: #fff;
+        }
+        .btn-primary:hover:not(:disabled) {
+            background: #3b5de7;
+        }
+        .btn-primary:disabled {
+            background: #b0bec5;
+            cursor: not-allowed;
+        }
+        .btn-success {
+            background: #22c55e;
+            color: #fff;
+        }
+        .btn-success:hover {
+            background: #16a34a;
+        }
+        .progress-section {
+            display: none;
+            margin-top: 24px;
+        }
+        .progress-section.active {
+            display: block;
+        }
+        .progress-bar-container {
+            background: #e5e7eb;
+            border-radius: 8px;
+            height: 12px;
+            overflow: hidden;
+            margin: 12px 0;
+        }
+        .progress-bar {
+            background: linear-gradient(90deg, #4a6cf7, #6d8cff);
+            height: 100%;
+            width: 0%;
+            border-radius: 8px;
+            transition: width 0.3s ease;
+        }
+        .progress-text {
+            color: #666;
+            font-size: 0.85rem;
+            display: flex;
+            justify-content: space-between;
+        }
+        .current-school {
+            color: #4a6cf7;
+            font-size: 0.85rem;
+            margin-top: 4px;
+            min-height: 1.2em;
+        }
+        .result-section {
+            display: none;
+            margin-top: 24px;
+            padding: 20px;
+            background: #f0fdf4;
+            border-radius: 12px;
+            border: 1px solid #bbf7d0;
+        }
+        .result-section.active {
+            display: block;
+        }
+        .result-section h3 {
+            color: #166534;
+            margin-bottom: 12px;
+            font-size: 1.1rem;
+        }
+        .result-section p {
+            color: #333;
+            font-size: 0.9rem;
+            margin-bottom: 16px;
+        }
+        .error-section {
+            display: none;
+            margin-top: 24px;
+            padding: 20px;
+            background: #fef2f2;
+            border-radius: 12px;
+            border: 1px solid #fecaca;
+        }
+        .error-section.active {
+            display: block;
+        }
+        .error-section p {
+            color: #991b1b;
+        }
+        .info-box {
+            background: #f8f9ff;
+            border: 1px solid #dde3ff;
+            border-radius: 8px;
+            padding: 16px;
+            margin-bottom: 24px;
+            font-size: 0.85rem;
+            color: #444;
+            line-height: 1.7;
+        }
+        .info-box strong {
+            color: #4a6cf7;
+        }
+        .tag {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-size: 0.75rem;
+            font-weight: 600;
+        }
+        .tag-blue { background: #dbeafe; color: #1d4ed8; }
+        .tag-green { background: #dcfce7; color: #166534; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>学校住所チェッカー</h1>
+        <p class="subtitle">
+            Excelファイルをアップロードすると、学校名と住所をAPIで照合・補完します。
+        </p>
+
+        <div class="info-box">
+            <strong>入力Excelの形式:</strong><br>
+            B列: 学校名 ／ C列: 郵便番号 ／ D列: 住所<br><br>
+            <strong>出力:</strong><br>
+            B列: 学校名 ／ C列: 郵便番号（元データ） ／
+            D列: <span class="tag tag-blue">郵便番号（住所から逆引き）</span> ／
+            E列: 住所（元データ） ／
+            F列: <span class="tag tag-green">住所（学校名APIから取得）</span>
+        </div>
+
+        <div class="upload-area" id="uploadArea">
+            <div class="upload-icon">📄</div>
+            <p class="upload-text">
+                ここにファイルをドラッグ＆ドロップ<br>
+                または <strong>クリックして選択</strong>
+            </p>
+            <p class="file-name" id="fileName" style="display:none;"></p>
+        </div>
+        <input type="file" id="fileInput" accept=".xlsx">
+
+        <button class="btn btn-primary" id="processBtn" disabled>処理を開始する</button>
+
+        <div class="progress-section" id="progressSection">
+            <div class="progress-text">
+                <span id="progressLabel">処理中...</span>
+                <span id="progressCount">0 / 0</span>
+            </div>
+            <div class="progress-bar-container">
+                <div class="progress-bar" id="progressBar"></div>
+            </div>
+            <div class="current-school" id="currentSchool"></div>
+        </div>
+
+        <div class="result-section" id="resultSection">
+            <h3>処理が完了しました</h3>
+            <p id="resultText"></p>
+            <button class="btn btn-success" id="downloadBtn">加工済みファイルをダウンロード</button>
+        </div>
+
+        <div class="error-section" id="errorSection">
+            <p id="errorText"></p>
+        </div>
+    </div>
+
+    <script>
+        const uploadArea = document.getElementById('uploadArea');
+        const fileInput = document.getElementById('fileInput');
+        const fileName = document.getElementById('fileName');
+        const processBtn = document.getElementById('processBtn');
+        const progressSection = document.getElementById('progressSection');
+        const progressBar = document.getElementById('progressBar');
+        const progressLabel = document.getElementById('progressLabel');
+        const progressCount = document.getElementById('progressCount');
+        const currentSchool = document.getElementById('currentSchool');
+        const resultSection = document.getElementById('resultSection');
+        const resultText = document.getElementById('resultText');
+        const downloadBtn = document.getElementById('downloadBtn');
+        const errorSection = document.getElementById('errorSection');
+        const errorText = document.getElementById('errorText');
+
+        let selectedFile = null;
+        let currentJobId = null;
+
+        uploadArea.addEventListener('click', () => fileInput.click());
+        uploadArea.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            uploadArea.classList.add('dragover');
+        });
+        uploadArea.addEventListener('dragleave', () => {
+            uploadArea.classList.remove('dragover');
+        });
+        uploadArea.addEventListener('drop', (e) => {
+            e.preventDefault();
+            uploadArea.classList.remove('dragover');
+            if (e.dataTransfer.files.length > 0) {
+                handleFile(e.dataTransfer.files[0]);
+            }
+        });
+        fileInput.addEventListener('change', () => {
+            if (fileInput.files.length > 0) {
+                handleFile(fileInput.files[0]);
+            }
+        });
+
+        function handleFile(file) {
+            if (!file.name.endsWith('.xlsx')) {
+                alert('.xlsx ファイルを選択してください');
+                return;
+            }
+            selectedFile = file;
+            fileName.textContent = file.name;
+            fileName.style.display = 'block';
+            uploadArea.classList.add('has-file');
+            uploadArea.querySelector('.upload-icon').textContent = '✅';
+            processBtn.disabled = false;
+
+            resultSection.classList.remove('active');
+            errorSection.classList.remove('active');
+            progressSection.classList.remove('active');
+        }
+
+        processBtn.addEventListener('click', async () => {
+            if (!selectedFile) return;
+
+            processBtn.disabled = true;
+            processBtn.textContent = 'アップロード中...';
+            errorSection.classList.remove('active');
+            resultSection.classList.remove('active');
+
+            const formData = new FormData();
+            formData.append('file', selectedFile);
+
+            try {
+                const res = await fetch('/upload', { method: 'POST', body: formData });
+                const data = await res.json();
+
+                if (data.error) {
+                    showError(data.error);
+                    processBtn.disabled = false;
+                    processBtn.textContent = '処理を開始する';
+                    return;
+                }
+
+                currentJobId = data.job_id;
+                progressSection.classList.add('active');
+                processBtn.textContent = '処理中...';
+                pollStatus();
+            } catch (err) {
+                showError('アップロードに失敗しました: ' + err.message);
+                processBtn.disabled = false;
+                processBtn.textContent = '処理を開始する';
+            }
+        });
+
+        async function pollStatus() {
+            if (!currentJobId) return;
+
+            try {
+                const res = await fetch(`/status/${currentJobId}`);
+                const data = await res.json();
+
+                if (data.status === 'processing' || data.status === 'queued') {
+                    const pct = data.total > 0 ? (data.progress / data.total * 100) : 0;
+                    progressBar.style.width = pct + '%';
+                    progressCount.textContent = `${data.progress} / ${data.total}`;
+                    progressLabel.textContent = '処理中...';
+                    currentSchool.textContent = data.current_school ? `処理中: ${data.current_school}` : '';
+                    setTimeout(pollStatus, 1000);
+                } else if (data.status === 'done') {
+                    progressBar.style.width = '100%';
+                    progressCount.textContent = `${data.total} / ${data.total}`;
+                    progressLabel.textContent = '完了!';
+                    currentSchool.textContent = '';
+
+                    resultText.textContent = `${data.total}校の処理が完了しました。`;
+                    resultSection.classList.add('active');
+                    processBtn.textContent = '処理を開始する';
+                    processBtn.disabled = false;
+                } else if (data.status === 'error') {
+                    showError('処理中にエラーが発生しました: ' + data.error);
+                    processBtn.textContent = '処理を開始する';
+                    processBtn.disabled = false;
+                }
+            } catch (err) {
+                showError('ステータス確認に失敗しました: ' + err.message);
+                processBtn.textContent = '処理を開始する';
+                processBtn.disabled = false;
+            }
+        }
+
+        downloadBtn.addEventListener('click', () => {
+            if (currentJobId) {
+                window.location.href = `/download/${currentJobId}`;
+            }
+        });
+
+        function showError(msg) {
+            errorText.textContent = msg;
+            errorSection.classList.add('active');
+        }
+    </script>
+</body>
+</html>
