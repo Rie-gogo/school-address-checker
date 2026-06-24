@@ -82,6 +82,8 @@ def address_to_zipcode(address, jusho_db):
             if not town_clean:
                 continue
 
+            town_clean = town_clean.replace("\u30F6", "\u30B1").replace("\u30F5", "\u30AB")
+
             results = jusho_db.search_addresses(town_clean)
             best_match = None
             for r in results:
