@@ -109,17 +109,22 @@ def address_to_zipcode(address, jusho_db):
     return ""
 
 
-def get_school_address(school_name, original_zipcode=None):
+def get_school_address(school_name, original_zipcode=None, original_address=None):
     if not school_name:
         return ""
 
     normalized = normalize_school_name(school_name)
-    search_terms = [normalized]
+    search_terms = []
+
+    if school_name != normalized:
+        search_terms.append(school_name)
+
+    search_terms.append(normalized)
 
     if normalized != school_name:
         half_normalized = school_name.replace("\uFF0D", "\u30FC").replace("－", "ー")
-        if half_normalized != normalized:
-            search_terms.insert(1, half_normalized)
+        if half_normalized != normalized and half_normalized != school_name:
+            search_terms.append(half_normalized)
 
     if " " in normalized or "\u3000" in normalized:
         parts = re.split(r"[ \u3000]+", normalized)
@@ -137,6 +142,12 @@ def get_school_address(school_name, original_zipcode=None):
     if no_campus != normalized:
         search_terms.append(no_campus)
 
+    original_pref = ""
+    if original_address:
+        pm = re.match(r"^(東京都|北海道|(?:京都|大阪)府|.{2,3}県)", original_address)
+        if pm:
+            original_pref = pm.group(1)
+
     for term in search_terms:
         try:
             r = requests.get(SCHOOL_API_URL, params={"s": term}, timeout=10)
@@ -147,6 +158,10 @@ def get_school_address(school_name, original_zipcode=None):
                 zip_str = str(int(original_zipcode)).zfill(7)
                 for s in results:
                     if s.get("postal_code") == zip_str:
+                        return s.get("location", "")
+            if original_pref:
+                for s in results:
+                    if s.get("location", "").startswith(original_pref):
                         return s.get("location", "")
             return results[0].get("location", "")
         except Exception:
@@ -178,7 +193,7 @@ def process_excel(job_id, input_path, output_path):
             original_address = ws.cell(row=row_idx, column=4).value
 
             reverse_zipcode = address_to_zipcode(original_address, thread_jusho)
-            school_address = get_school_address(school_name, zipcode)
+            school_address = get_school_address(school_name, zipcode, original_address)
 
             ws.cell(row=row_idx, column=4).value = reverse_zipcode
             ws.cell(row=row_idx, column=5).value = original_address
