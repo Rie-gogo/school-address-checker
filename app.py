@@ -3,10 +3,16 @@ import uuid
 import threading
 import time
 import re
+import sqlite3
 
 from flask import Flask, request, jsonify, send_file, render_template
 import openpyxl
 from jusho import Jusho
+import posuto
+
+# posuto は日本郵便KEN_ALLの最新データを同梱しており、
+# jusho（同梱DBが古い）で見つからない町名のフォールバックに使う
+POSUTO_DB = os.path.join(os.path.dirname(posuto.__file__), "postaldata.db")
 
 app = Flask(__name__)
 _base_dir = os.environ.get("RENDER", None)
@@ -163,7 +169,43 @@ def _search_with_city_match(town_clean, pref, city, jusho_db):
     return exact_match or sonota_match or subarea_match or best_match
 
 
-def address_to_zipcode(address, jusho_db):
+def _posuto_city_match(town_clean, pref, city, conn):
+    rows = conn.execute(
+        "SELECT code, city, neighborhood, data FROM postal_data "
+        "WHERE prefecture = ? AND neighborhood LIKE ?",
+        (pref, "%" + town_clean + "%"),
+    ).fetchall()
+    city_variants = _build_city_variants(city)
+
+    sonota_match = None
+    exact_match = None
+    subarea_match = None
+    best_match = None
+    for code, rcity, neighborhood, data in rows:
+        city_matched = any(cv in rcity for cv in city_variants)
+        if not city_matched:
+            city_parts = re.findall(r"[^市区町村郡]+[市区町村]", city)
+            if city_parts and all(part in rcity for part in city_parts):
+                city_matched = True
+        if not city_matched:
+            continue
+        if neighborhood == town_clean:
+            # koazabanchi=true は「（その他）」相当の代表郵便番号
+            if '"koazabanchi": true' in data:
+                if sonota_match is None:
+                    sonota_match = code
+            elif exact_match is None:
+                exact_match = code
+        elif neighborhood.startswith(town_clean):
+            if subarea_match is None:
+                subarea_match = code
+        if best_match is None:
+            best_match = code
+
+    return sonota_match or exact_match or subarea_match or best_match
+
+
+def _find_zipcode(address, search_fn):
     if not address:
         return ""
 
@@ -238,6 +280,10 @@ def address_to_zipcode(address, jusho_db):
             # 複合地名のフォールバック: 末尾から1文字ずつ短縮（例: 西今宿阿弥陀寺 → 西今宿）
             for cut in range(len(town_clean) - 1, 1, -1):
                 base_towns.append(town_clean[:cut])
+            # 最終手段: 先頭の余分な1〜2文字を除去（例: 元データ誤記「立柏の森」→「柏の森」）
+            for drop in (1, 2):
+                if len(town_clean) - drop >= 2:
+                    base_towns.append(town_clean[drop:])
 
             seen = set()
             for base in base_towns:
@@ -246,11 +292,25 @@ def address_to_zipcode(address, jusho_db):
                         if dv in seen or not dv:
                             continue
                         seen.add(dv)
-                        result = _search_with_city_match(dv, pref, city, jusho_db)
+                        result = search_fn(dv, pref, city)
                         if result:
                             return result
     return ""
 
+
+def address_to_zipcode(address, jusho_db, posuto_conn=None):
+    # まず jusho（小字・その他の優先ロジック付き）で検索
+    result = _find_zipcode(
+        address, lambda dv, pref, city: _search_with_city_match(dv, pref, city, jusho_db)
+    )
+    if result:
+        return result
+    # 見つからなければ最新KEN_ALL（posuto）でフォールバック
+    if posuto_conn is not None:
+        result = _find_zipcode(
+            address, lambda dv, pref, city: _posuto_city_match(dv, pref, city, posuto_conn)
+        )
+    return result
 
 
 def process_excel(job_id, input_path, output_path):
@@ -258,6 +318,7 @@ def process_excel(job_id, input_path, output_path):
         jobs[job_id]["status"] = "processing"
         # Create per-thread jusho instance to avoid SQLite threading issues
         thread_jusho = Jusho()
+        thread_posuto = sqlite3.connect(POSUTO_DB, check_same_thread=False)
 
         wb = openpyxl.load_workbook(input_path)
         ws = wb.active
@@ -275,7 +336,7 @@ def process_excel(job_id, input_path, output_path):
             zipcode = ws.cell(row=row_idx, column=3).value
             original_address = ws.cell(row=row_idx, column=4).value
 
-            reverse_zipcode = address_to_zipcode(original_address, thread_jusho)
+            reverse_zipcode = address_to_zipcode(original_address, thread_jusho, thread_posuto)
 
             ws.cell(row=row_idx, column=4).value = reverse_zipcode
             ws.cell(row=row_idx, column=5).value = original_address
