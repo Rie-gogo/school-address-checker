@@ -177,8 +177,9 @@ def _posuto_city_match(town_clean, pref, city, conn):
     ).fetchall()
     city_variants = _build_city_variants(city)
 
-    sonota_match = None
-    exact_match = None
+    exact_full = None    # 町名完全一致かつ非分割（その町域＝単一郵便番号の確定値）
+    sonota_match = None   # koazabanchi=true =「（その他）」相当の代表郵便番号
+    exact_partial = None  # 町名完全一致だが小字/丁目で分割
     subarea_match = None
     best_match = None
     for code, rcity, neighborhood, data in rows:
@@ -190,19 +191,21 @@ def _posuto_city_match(town_clean, pref, city, conn):
         if not city_matched:
             continue
         if neighborhood == town_clean:
-            # koazabanchi=true は「（その他）」相当の代表郵便番号
             if '"koazabanchi": true' in data:
                 if sonota_match is None:
                     sonota_match = code
-            elif exact_match is None:
-                exact_match = code
+            elif '"partial": false' in data:
+                if exact_full is None:
+                    exact_full = code
+            elif exact_partial is None:
+                exact_partial = code
         elif neighborhood.startswith(town_clean):
             if subarea_match is None:
                 subarea_match = code
         if best_match is None:
             best_match = code
 
-    return sonota_match or exact_match or subarea_match or best_match
+    return exact_full or sonota_match or exact_partial or subarea_match or best_match
 
 
 def _find_zipcode(address, search_fn):
@@ -299,18 +302,17 @@ def _find_zipcode(address, search_fn):
 
 
 def address_to_zipcode(address, jusho_db, posuto_conn=None):
-    # まず jusho（小字・その他の優先ロジック付き）で検索
-    result = _find_zipcode(
-        address, lambda dv, pref, city: _search_with_city_match(dv, pref, city, jusho_db)
-    )
-    if result:
-        return result
-    # 見つからなければ最新KEN_ALL（posuto）でフォールバック
+    # 常に最新の日本郵便KEN_ALL（posuto）を主データ源として優先
     if posuto_conn is not None:
         result = _find_zipcode(
             address, lambda dv, pref, city: _posuto_city_match(dv, pref, city, posuto_conn)
         )
-    return result
+        if result:
+            return result
+    # posutoで見つからない場合のみ jusho（旧DB）にフォールバック
+    return _find_zipcode(
+        address, lambda dv, pref, city: _search_with_city_match(dv, pref, city, jusho_db)
+    )
 
 
 def process_excel(job_id, input_path, output_path):
