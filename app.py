@@ -405,17 +405,31 @@ def status(job_id):
 
 @app.route("/download/<job_id>")
 def download(job_id):
-    if job_id not in jobs:
-        return jsonify({"error": "ジョブが見つかりません"}), 404
-    job = jobs[job_id]
-    if job["status"] != "done":
-        return jsonify({"error": "処理がまだ完了していません"}), 400
+    # jobs はプロセス内メモリのため、ワーカー再起動などで失われることがある。
+    # その場合でも結果ファイルがディスクに残っていれば配信できるようにする。
+    default_path = os.path.join(
+        app.config["RESULT_FOLDER"], f"{job_id}_output.xlsx"
+    )
+    job = jobs.get(job_id)
 
-    original = job.get("original_filename", "output.xlsx")
+    if job is not None:
+        if job["status"] != "done":
+            return jsonify({"error": "処理がまだ完了していません"}), 400
+        output_path = job["output_path"]
+        original = job.get("original_filename", "output.xlsx")
+    else:
+        if not os.path.exists(default_path):
+            return jsonify({
+                "error": "時間が経過したため処理結果が失われました。"
+                         "お手数ですが、もう一度アップロードして処理してください。"
+            }), 404
+        output_path = default_path
+        original = "output.xlsx"
+
     name_base = os.path.splitext(original)[0]
     download_name = f"{name_base}_processed.xlsx"
 
-    return send_file(job["output_path"], as_attachment=True, download_name=download_name)
+    return send_file(output_path, as_attachment=True, download_name=download_name)
 
 
 if __name__ == "__main__":
