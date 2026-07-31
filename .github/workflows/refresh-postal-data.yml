@@ -1,0 +1,27 @@
+name: Refresh postal data
+
+# 郵便番号データ(posuto)は毎月PyPIで最新版が配信される。
+# 毎月1日にRenderへ再デプロイを走らせ、ビルド時に最新のposutoを
+# 自動インストールすることで、常に最新の日本郵便KEN_ALLデータを反映する。
+on:
+  schedule:
+    - cron: "0 0 1 * *" # 毎月1日 00:00 UTC
+  workflow_dispatch: {} # 手動実行も可能
+
+jobs:
+  redeploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger Render redeploy (installs latest posuto)
+        env:
+          RENDER_DEPLOY_HOOK_URL: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
+        run: |
+          if [ -z "$RENDER_DEPLOY_HOOK_URL" ]; then
+            echo "::error::RENDER_DEPLOY_HOOK_URL secret が未設定です。"
+            echo "Render のサービス設定 (Settings > Deploy Hook) で URL を取得し、"
+            echo "GitHub リポジトリの Settings > Secrets and variables > Actions に"
+            echo "RENDER_DEPLOY_HOOK_URL として登録してください。"
+            exit 1
+          fi
+          curl -fsSL -X POST "$RENDER_DEPLOY_HOOK_URL"
+          echo "Render への再デプロイをトリガーしました。"

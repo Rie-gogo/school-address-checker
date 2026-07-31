@@ -3,10 +3,16 @@ import uuid
 import threading
 import time
 import re
+import sqlite3
 
 from flask import Flask, request, jsonify, send_file, render_template
 import openpyxl
 from jusho import Jusho
+import posuto
+
+# posuto は日本郵便KEN_ALLの最新データを同梱しており、
+# jusho（同梱DBが古い）で見つからない町名のフォールバックに使う
+POSUTO_DB = os.path.join(os.path.dirname(posuto.__file__), "postaldata.db")
 
 app = Flask(__name__)
 _base_dir = os.environ.get("RENDER", None)
@@ -29,17 +35,101 @@ WARD_REMAP = {
     "浜松市浜名区": ["浜松市西区", "浜松市北区", "浜松市浜北区"],
 }
 
+# 住所表記で相互に揺れる異体字・仮名
+KANJI_ADDR_VARIANTS = {
+    "州": "洲", "洲": "州", "磯": "礒", "礒": "磯",
+    "槙": "槇", "槇": "槙", "諌": "諫", "諫": "諌",
+    "繩": "縄", "縄": "繩", "鴎": "鷗", "鷗": "鴎",
+    "一": "壱", "壱": "一",
+}
+
+KE_GROUP = ["\u30f6", "\u30b1", "\u304c", "\u30ac"]  # ヶ ケ が ガ
+
+
+def _char_variants(s):
+    variants = [s]
+
+    # ヶ/ケ/が/ガ は地名で相互に揺れる
+    for i, ch in enumerate(s):
+        if ch in KE_GROUP:
+            expanded = []
+            for v in variants:
+                for repl in KE_GROUP:
+                    expanded.append(v[:i] + repl + v[i + 1:])
+            variants = expanded
+
+    # ノ/の の揺れ、および省略
+    no_expanded = []
+    for v in variants:
+        no_expanded.append(v)
+        if "\u30ce" in v or "\u306e" in v:
+            no_expanded.append(v.replace("\u30ce", "\u306e"))
+            no_expanded.append(v.replace("\u306e", "\u30ce"))
+            no_expanded.append(v.replace("\u30ce", "").replace("\u306e", ""))
+    variants = no_expanded
+
+    # 異体字
+    kanji_expanded = []
+    for v in variants:
+        kanji_expanded.append(v)
+        for old, new in KANJI_ADDR_VARIANTS.items():
+            if old in v:
+                kanji_expanded.append(v.replace(old, new))
+    variants = kanji_expanded
+
+    seen = set()
+    result = []
+    for v in variants:
+        if v and v not in seen:
+            seen.add(v)
+            result.append(v)
+    return result
+
+
+def _digit_variants(s):
+    half = "0123456789"
+    full = "\uff10\uff11\uff12\uff13\uff14\uff15\uff16\uff17\uff18\uff19"
+    to_full = s.translate(str.maketrans(half, full))
+    to_half = s.translate(str.maketrans(full, half))
+    out = [s]
+    for v in (to_full, to_half):
+        if v not in out:
+            out.append(v)
+    return out
+
+
+def _build_city_variants(city):
+    variants = [city]
+    for new_ward, old_wards in WARD_REMAP.items():
+        if city == new_ward:
+            variants.extend(old_wards)
+            break
+    # 郡下の町村が市に昇格したケース（例: 岩手郡滝沢村 → 滝沢市）
+    if "\u90e1" in city:
+        gm = re.search(r"\u90e1(.+?)[\u753a\u6751]$", city)
+        if gm:
+            core = gm.group(1)
+            variants.extend([core + "\u5e02", core + "\u753a", core + "\u6751"])
+    # ヶ/ケ 等の揺れ
+    expanded = []
+    for v in variants:
+        expanded.extend(_char_variants(v))
+    seen = set()
+    out = []
+    for v in expanded:
+        if v not in seen:
+            seen.add(v)
+            out.append(v)
+    return out
+
 
 def _search_with_city_match(town_clean, pref, city, jusho_db):
     results = jusho_db.search_addresses(town_clean)
-    city_variants = [city]
-    for new_ward, old_wards in WARD_REMAP.items():
-        if city == new_ward:
-            city_variants.extend(old_wards)
-            break
+    city_variants = _build_city_variants(city)
 
     exact_match = None
     sonota_match = None
+    subarea_match = None
     best_match = None
     for r in results:
         addr_str = str(r)
@@ -60,21 +150,65 @@ def _search_with_city_match(town_clean, pref, city, jusho_db):
         if not zm:
             continue
         zipcode = zm.group(1).replace("-", "")
-        is_exact = (f" {town_clean}(" in addr_str or f" {town_clean}\uff08" in addr_str
-                    or addr_str.endswith(f" {town_clean}"))
-        if is_exact:
-            if "\uff08\u305d\u306e\u4ed6\uff09" in addr_str:
+        # 町名の直後がローマ字開き括弧 "(" = 小字なしの完全一致
+        # 町名の直後が末尾 = 完全一致
+        if f" {town_clean}(" in addr_str or addr_str.endswith(f" {town_clean}"):
+            if exact_match is None:
+                exact_match = zipcode
+        # 「（その他）」= 小字を特定できない場合の代表郵便番号
+        elif f" {town_clean}\uff08\u305d\u306e\u4ed6\uff09" in addr_str:
+            if sonota_match is None:
                 sonota_match = zipcode
-            elif f" {town_clean}(" in addr_str or addr_str.endswith(f" {town_clean}"):
-                if exact_match is None:
-                    exact_match = zipcode
+        # 町名の直後が全角括弧 = 小字・丁目範囲付き（その他が無い場合の候補）
+        elif f" {town_clean}\uff08" in addr_str:
+            if subarea_match is None:
+                subarea_match = zipcode
         if best_match is None:
             best_match = zipcode
 
-    return exact_match or sonota_match or best_match
+    return exact_match or sonota_match or subarea_match or best_match
 
 
-def address_to_zipcode(address, jusho_db):
+def _posuto_city_match(town_clean, pref, city, conn):
+    rows = conn.execute(
+        "SELECT code, city, neighborhood, data FROM postal_data "
+        "WHERE prefecture = ? AND neighborhood LIKE ?",
+        (pref, "%" + town_clean + "%"),
+    ).fetchall()
+    city_variants = _build_city_variants(city)
+
+    exact_full = None    # 町名完全一致かつ非分割（その町域＝単一郵便番号の確定値）
+    sonota_match = None   # koazabanchi=true =「（その他）」相当の代表郵便番号
+    exact_partial = None  # 町名完全一致だが小字/丁目で分割
+    subarea_match = None
+    best_match = None
+    for code, rcity, neighborhood, data in rows:
+        city_matched = any(cv in rcity for cv in city_variants)
+        if not city_matched:
+            city_parts = re.findall(r"[^市区町村郡]+[市区町村]", city)
+            if city_parts and all(part in rcity for part in city_parts):
+                city_matched = True
+        if not city_matched:
+            continue
+        if neighborhood == town_clean:
+            if '"koazabanchi": true' in data:
+                if sonota_match is None:
+                    sonota_match = code
+            elif '"partial": false' in data:
+                if exact_full is None:
+                    exact_full = code
+            elif exact_partial is None:
+                exact_partial = code
+        elif neighborhood.startswith(town_clean):
+            if subarea_match is None:
+                subarea_match = code
+        if best_match is None:
+            best_match = code
+
+    return exact_full or sonota_match or exact_partial or subarea_match or best_match
+
+
+def _find_zipcode(address, search_fn):
     if not address:
         return ""
 
@@ -94,7 +228,7 @@ def address_to_zipcode(address, jusho_db):
                 addr = pref + addr
                 break
 
-    NUM_CHARS = r"[\d０-９一二三四五六七八九十]"
+    NUM_CHARS = r"[\d０-９]"
     patterns = [
         rf"^(東京都|北海道|(?:京都|大阪)府|.{{2,3}}県)(.+?市.+?区)(.+?)(?:{NUM_CHARS}|$)",
         rf"^(東京都)(.+?区)(.+?)(?:{NUM_CHARS}|$)",
@@ -107,33 +241,78 @@ def address_to_zipcode(address, jusho_db):
         m = re.match(pat, addr)
         if m:
             pref, city, town = m.group(1), m.group(2), m.group(3)
+            # 市名に「市」が二つ含まれる誤分割を補正（例: 四日市市/野々市市 → town="市桜町"）
+            town = re.sub(r"^市(?=.)", "", town)
             town_clean = re.sub(r"[０-９0-9一二三四五六七八九十丁目番地号の\-－ー・]+$", "", town).strip()
             town_clean = re.sub(r"^(?:大字|字)", "", town_clean)
-            if not town_clean:
+            if not town_clean and not town:
                 continue
 
-            town_clean = town_clean.replace("\u30F6", "\u30B1").replace("\u30F5", "\u30AB")
-
-            town_variants = [town_clean]
-            aza_split = re.split(r"字", town_clean)
-            if len(aza_split) > 1 and aza_split[0]:
-                town_variants.append(aza_split[0])
+            base_towns = []
+            if town_clean:
+                base_towns.append(town_clean)
+            # 元の町名（末尾の丁目等を除去する前）も試す（例: 六番丁）
+            raw_town = re.sub(r"^(?:大字|字)", "", town)
+            if raw_town and raw_town not in base_towns:
+                base_towns.append(raw_town)
+            # 市名が町名に重複して残るケースを除去（例: 富谷市富谷町成田 → 成田）
+            city_core = re.sub(r"^.+郡", "", city)
+            city_core = re.sub(r"[市区町村]$", "", city_core)
+            if city_core and town_clean.startswith(city_core):
+                deduped = re.sub(r"^[市区町村]", "", town_clean[len(city_core):])
+                if deduped and deduped != town_clean:
+                    base_towns.append(deduped)
+            if not town_clean:
+                town_clean = raw_town
+            # 「字」「大字」の処理: 除去 / 分割（例: 脇町大字脇町 → 脇町脇町、滝沢字牧野林 → 牧野林）
+            if "字" in town_clean:
+                base_towns.append(town_clean.replace("大字", "").replace("字", ""))
+                aza_split = [p for p in re.split(r"大字|字", town_clean) if p]
+                base_towns.extend(aza_split)
+            # 京都の通り名住所（例: 壬生通八条下ル東寺町 → 東寺町）
+            kyoto_split = re.split(r"(?:上る|下る|上ル|下ル|東入る|西入る|東入ル|西入ル|東入|西入)", town_clean)
+            if len(kyoto_split) > 1 and kyoto_split[-1]:
+                base_towns.append(kyoto_split[-1])
+            # 「町」境界での区切り（例: 明大寺町伝馬 → 明大寺町）
             machi_match = re.match(r"^(.+?町)", town_clean)
             if machi_match and machi_match.group(1) != town_clean:
-                town_variants.append(machi_match.group(1))
-            if len(town_clean) > 3:
-                town_variants.append(town_clean[:len(town_clean) * 2 // 3])
+                base_towns.append(machi_match.group(1))
+            # 末尾「町」の除去（例: 佐藤町 → 佐藤）
+            if town_clean.endswith("町") and len(town_clean) > 2:
+                base_towns.append(town_clean[:-1])
+            # 複合地名のフォールバック: 末尾から1文字ずつ短縮（例: 西今宿阿弥陀寺 → 西今宿）
+            for cut in range(len(town_clean) - 1, 1, -1):
+                base_towns.append(town_clean[:cut])
+            # 最終手段: 先頭の余分な1〜2文字を除去（例: 元データ誤記「立柏の森」→「柏の森」）
+            for drop in (1, 2):
+                if len(town_clean) - drop >= 2:
+                    base_towns.append(town_clean[drop:])
 
             seen = set()
-            for tv in town_variants:
-                if tv in seen or not tv:
-                    continue
-                seen.add(tv)
-                result = _search_with_city_match(tv, pref, city, jusho_db)
-                if result:
-                    return result
+            for base in base_towns:
+                for tv in _char_variants(base):
+                    for dv in _digit_variants(tv):
+                        if dv in seen or not dv:
+                            continue
+                        seen.add(dv)
+                        result = search_fn(dv, pref, city)
+                        if result:
+                            return result
     return ""
 
+
+def address_to_zipcode(address, jusho_db, posuto_conn=None):
+    # 常に最新の日本郵便KEN_ALL（posuto）を主データ源として優先
+    if posuto_conn is not None:
+        result = _find_zipcode(
+            address, lambda dv, pref, city: _posuto_city_match(dv, pref, city, posuto_conn)
+        )
+        if result:
+            return result
+    # posutoで見つからない場合のみ jusho（旧DB）にフォールバック
+    return _find_zipcode(
+        address, lambda dv, pref, city: _search_with_city_match(dv, pref, city, jusho_db)
+    )
 
 
 def process_excel(job_id, input_path, output_path):
@@ -141,6 +320,7 @@ def process_excel(job_id, input_path, output_path):
         jobs[job_id]["status"] = "processing"
         # Create per-thread jusho instance to avoid SQLite threading issues
         thread_jusho = Jusho()
+        thread_posuto = sqlite3.connect(POSUTO_DB, check_same_thread=False)
 
         wb = openpyxl.load_workbook(input_path)
         ws = wb.active
@@ -158,7 +338,7 @@ def process_excel(job_id, input_path, output_path):
             zipcode = ws.cell(row=row_idx, column=3).value
             original_address = ws.cell(row=row_idx, column=4).value
 
-            reverse_zipcode = address_to_zipcode(original_address, thread_jusho)
+            reverse_zipcode = address_to_zipcode(original_address, thread_jusho, thread_posuto)
 
             ws.cell(row=row_idx, column=4).value = reverse_zipcode
             ws.cell(row=row_idx, column=5).value = original_address
@@ -225,17 +405,31 @@ def status(job_id):
 
 @app.route("/download/<job_id>")
 def download(job_id):
-    if job_id not in jobs:
-        return jsonify({"error": "ジョブが見つかりません"}), 404
-    job = jobs[job_id]
-    if job["status"] != "done":
-        return jsonify({"error": "処理がまだ完了していません"}), 400
+    # jobs はプロセス内メモリのため、ワーカー再起動などで失われることがある。
+    # その場合でも結果ファイルがディスクに残っていれば配信できるようにする。
+    default_path = os.path.join(
+        app.config["RESULT_FOLDER"], f"{job_id}_output.xlsx"
+    )
+    job = jobs.get(job_id)
 
-    original = job.get("original_filename", "output.xlsx")
+    if job is not None:
+        if job["status"] != "done":
+            return jsonify({"error": "処理がまだ完了していません"}), 400
+        output_path = job["output_path"]
+        original = job.get("original_filename", "output.xlsx")
+    else:
+        if not os.path.exists(default_path):
+            return jsonify({
+                "error": "時間が経過したため処理結果が失われました。"
+                         "お手数ですが、もう一度アップロードして処理してください。"
+            }), 404
+        output_path = default_path
+        original = "output.xlsx"
+
     name_base = os.path.splitext(original)[0]
     download_name = f"{name_base}_processed.xlsx"
 
-    return send_file(job["output_path"], as_attachment=True, download_name=download_name)
+    return send_file(output_path, as_attachment=True, download_name=download_name)
 
 
 if __name__ == "__main__":

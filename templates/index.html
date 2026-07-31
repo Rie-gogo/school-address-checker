@@ -258,6 +258,8 @@
 
         let selectedFile = null;
         let currentJobId = null;
+        let downloadBlobUrl = null;
+        let downloadFilename = 'processed.xlsx';
 
         uploadArea.addEventListener('click', () => fileInput.click());
         uploadArea.addEventListener('dragover', (e) => {
@@ -291,6 +293,8 @@
             uploadArea.classList.add('has-file');
             uploadArea.querySelector('.upload-icon').textContent = '✅';
             processBtn.disabled = false;
+
+            if (downloadBlobUrl) { URL.revokeObjectURL(downloadBlobUrl); downloadBlobUrl = null; }
 
             resultSection.classList.remove('active');
             errorSection.classList.remove('active');
@@ -350,10 +354,16 @@
                     progressLabel.textContent = '完了!';
                     currentSchool.textContent = '';
 
-                    resultText.textContent = `${data.total}校の処理が完了しました。`;
+                    resultText.textContent = `${data.total}校の処理が完了しました。ダウンロードの準備をしています...`;
                     resultSection.classList.add('active');
+                    downloadBtn.disabled = true;
                     processBtn.textContent = '処理を開始する';
                     processBtn.disabled = false;
+
+                    // 処理完了直後に結果をブラウザ側へ取り込む。
+                    // こうすることで、しばらく放置してサーバーがスリープしても
+                    // ダウンロードがブラウザのメモリから確実に行える。
+                    prepareDownload(data.total);
                 } else if (data.status === 'error') {
                     showError('処理中にエラーが発生しました: ' + data.error);
                     processBtn.textContent = '処理を開始する';
@@ -366,8 +376,33 @@
             }
         }
 
+        async function prepareDownload(total) {
+            if (!currentJobId) return;
+            downloadFilename = (selectedFile ? selectedFile.name.replace(/\.xlsx$/i, '') : 'output') + '_processed.xlsx';
+            try {
+                const res = await fetch(`/download/${currentJobId}`);
+                if (!res.ok) throw new Error('server ' + res.status);
+                const blob = await res.blob();
+                if (downloadBlobUrl) URL.revokeObjectURL(downloadBlobUrl);
+                downloadBlobUrl = URL.createObjectURL(blob);
+                resultText.textContent = `${total}校の処理が完了しました。`;
+            } catch (err) {
+                // 取り込みに失敗しても、ダウンロード時に直接サーバーへ取りにいく
+                resultText.textContent = `${total}校の処理が完了しました。`;
+            } finally {
+                downloadBtn.disabled = false;
+            }
+        }
+
         downloadBtn.addEventListener('click', () => {
-            if (currentJobId) {
+            if (downloadBlobUrl) {
+                const a = document.createElement('a');
+                a.href = downloadBlobUrl;
+                a.download = downloadFilename;
+                document.body.appendChild(a);
+                a.click();
+                a.remove();
+            } else if (currentJobId) {
                 window.location.href = `/download/${currentJobId}`;
             }
         });
