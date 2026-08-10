@@ -3,6 +3,7 @@ import uuid
 import threading
 import time
 import re
+import json
 import sqlite3
 
 from flask import Flask, request, jsonify, send_file, render_template
@@ -43,7 +44,7 @@ KANJI_ADDR_VARIANTS = {
     "一": "壱", "壱": "一",
 }
 
-KE_GROUP = ["\u30f6", "\u30b1", "\u304c", "\u30ac"]  # ヶ ケ が ガ
+KE_GROUP = ["ヶ", "ケ", "が", "ガ"]  # ヶ ケ が ガ
 
 
 def _char_variants(s):
@@ -62,10 +63,10 @@ def _char_variants(s):
     no_expanded = []
     for v in variants:
         no_expanded.append(v)
-        if "\u30ce" in v or "\u306e" in v:
-            no_expanded.append(v.replace("\u30ce", "\u306e"))
-            no_expanded.append(v.replace("\u306e", "\u30ce"))
-            no_expanded.append(v.replace("\u30ce", "").replace("\u306e", ""))
+        if "ノ" in v or "の" in v:
+            no_expanded.append(v.replace("ノ", "の"))
+            no_expanded.append(v.replace("の", "ノ"))
+            no_expanded.append(v.replace("ノ", "").replace("の", ""))
     variants = no_expanded
 
     # 異体字
@@ -86,9 +87,159 @@ def _char_variants(s):
     return result
 
 
+KANJI_DIGITS = "〇一二三四五六七八九"
+
+
+def _to_kanji_num(n):
+    if n < 10:
+        return KANJI_DIGITS[n]
+    tens, ones = divmod(n, 10)
+    head = "" if tens == 1 else KANJI_DIGITS[tens]
+    return head + "十" + (KANJI_DIGITS[ones] if ones else "")
+
+
+def _jo_town_candidates(rest):
+    """北海道式の連番町名（例: 北16条西、屯田7条、東5条南、川端町5条）の候補を作る。
+
+    町名の途中に数字が入るため通常のパースでは数字の直前で切れてしまい、
+    「北」だけで検索して別の条にマッチしてしまうのを防ぐ。
+    """
+    if not rest:
+        return []
+    a = rest.translate(
+        str.maketrans("０１２３４５６７８９", "0123456789")
+    )
+    m = re.match(r"^([^\d]{1,8}?)(\d{1,2})\s*(条)?\s*([東西南北])?", a)
+    if not m:
+        return []
+    prefix, num, jo, direction = m.group(1), int(m.group(2)), m.group(3), m.group(4)
+    if not prefix or num == 0:
+        return []
+    # 「条」が省略された表記（例: 北25西11）は、方角で始まり方角が続く形のみ対象にする
+    if not jo and not (prefix in "東西南北" and direction):
+        return []
+    out = []
+    for num_str in (_to_kanji_num(num), str(num)):
+        stem = f"{prefix}{num_str}条"
+        if direction:
+            out.append(stem + direction)
+        out.append(stem)
+    return out
+
+
+def _to_half(s):
+    return s.translate(str.maketrans("０１２３４５６７８９", "0123456789"))
+
+
+def _first_nums(s):
+    """先頭から2つの数字を返す（例: 戸山3-19-1 → (3, 19)）。"""
+    found = [int(x) for x in re.findall(r"\d+", s)[:2]]
+    while len(found) < 2:
+        found.append(None)
+    return found[0], found[1]
+
+
+def _is_chome_style(rest):
+    """町名の直後の数字が丁目か番地かを推定する。
+
+    同じ町名に丁目用/番地用の2つの郵便番号がある場合の判定に使う。
+    丁目は通常 50 以下なので、それを超える数字は番地とみなす。
+    """
+    if not rest:
+        return False
+    a = _to_half(rest)
+    if "丁目" in a:
+        return True
+    m = re.search(r"\d+", a)
+    return m is not None and int(m.group()) <= 50
+
+
+def _parse_note_nums(text):
+    """「1〜6」「1、2」「18・21」のような注記から数字の集合を作る。"""
+    nums = set()
+    for part in re.split(r"[、・,，]", _to_half(text)):
+        rng = re.match(r"\s*(\d+)\s*[〜~～\-−]\s*(\d+)", part)
+        if rng:
+            lo, hi = int(rng.group(1)), int(rng.group(2))
+            if lo <= hi <= lo + 10000:
+                nums.update(range(lo, hi + 1))
+            continue
+        one = re.search(r"\d+", part)
+        if one:
+            nums.add(int(one.group()))
+    return nums
+
+
+# 注記と住所の整合度。大きいほど優先して採用する。
+NOTE_CONFIRMED = 5   # 注記が住所と明確に一致
+NOTE_NONE = 3        # 注記なし
+NOTE_SONOTA = 1      # 「その他」= 受け皿
+NOTE_MISMATCH = 0    # 注記が住所と明確に不一致
+
+
+def _note_rank(note, rest, chome_style, num, num2=None):
+    """KEN_ALLの注記（丁目/番地/その他/小字名/範囲）と住所の整合度を判定する。
+
+    同じ町名に複数の郵便番号がある場合、どれを採るべきかは注記で決まる。
+    例: 新宿区戸山 = 169-0052「3丁目18・21番」/ 162-0052「その他」
+    """
+    if not note:
+        return NOTE_NONE
+    if note == "その他":
+        return NOTE_SONOTA
+    if note == "丁目":
+        return NOTE_CONFIRMED if chome_style else NOTE_MISMATCH
+    if note == "番地":
+        return NOTE_MISMATCH if chome_style else NOTE_CONFIRMED
+    # 小字・団地名の列挙（例: 「追分、追分西、上北野、長沼」）
+    for part in re.split(r"[、・]", note):
+        if part and not re.search(r"\d", part) and part in rest:
+            return NOTE_CONFIRMED
+    # 丁目の指定（例: 「1〜6丁目」「1、2丁目、3丁目1番〜282番」）
+    chome_specs = re.findall(r"([\d０-９、・〜~～\-−]+)丁目", note)
+    if chome_specs:
+        if not chome_style:
+            return NOTE_MISMATCH
+        chome_nums = set()
+        for spec in chome_specs:
+            chome_nums |= _parse_note_nums(spec)
+        if num not in chome_nums:
+            return NOTE_MISMATCH
+        # 丁目の指定が1つだけなら、続く「N番」の限定も判定に使う
+        # （例: 戸山 169-0052「3丁目18・21番」）
+        if len(chome_specs) == 1 and not _banchi_matches(note, num2):
+            return NOTE_MISMATCH
+        return NOTE_CONFIRMED
+    if "番" in note:
+        # 番地の範囲指定（例: 小野町 891-1222「4784〜5118番地」）
+        if chome_style or not _banchi_matches(note, num):
+            return NOTE_MISMATCH
+        return NOTE_CONFIRMED
+    # 小字・団地名などの注記が住所に見当たらない場合は「その他」より下げる
+    return NOTE_MISMATCH
+
+
+def _banchi_matches(note, num):
+    """注記の「N番」「N番〜M番」「N番以上」等と番地が整合するか判定する。"""
+    flat = re.sub(r"番(?=[〜~～\-−])", "", note)
+    m = re.search(r"([\d０-９、・〜~～\-−]+)番地?\s*(以上|以下|以内)?", flat)
+    if not m:
+        return True
+    nums = _parse_note_nums(m.group(1))
+    if not nums:
+        return True
+    if num is None:
+        return False
+    if m.group(2) == "以上":
+        return num >= min(nums)
+    if m.group(2) in ("以下", "以内"):
+        return num <= max(nums)
+    return num in nums
+
+
 def _digit_variants(s):
     half = "0123456789"
-    full = "\uff10\uff11\uff12\uff13\uff14\uff15\uff16\uff17\uff18\uff19"
+    full = "０１２３４５６７８９"
     to_full = s.translate(str.maketrans(half, full))
     to_half = s.translate(str.maketrans(full, half))
     out = [s]
@@ -105,11 +256,11 @@ def _build_city_variants(city):
             variants.extend(old_wards)
             break
     # 郡下の町村が市に昇格したケース（例: 岩手郡滝沢村 → 滝沢市）
-    if "\u90e1" in city:
-        gm = re.search(r"\u90e1(.+?)[\u753a\u6751]$", city)
+    if "郡" in city:
+        gm = re.search(r"郡(.+?)[町村]$", city)
         if gm:
             core = gm.group(1)
-            variants.extend([core + "\u5e02", core + "\u753a", core + "\u6751"])
+            variants.extend([core + "市", core + "町", core + "村"])
     # ヶ/ケ 等の揺れ
     expanded = []
     for v in variants:
@@ -123,7 +274,8 @@ def _build_city_variants(city):
     return out
 
 
-def _search_with_city_match(town_clean, pref, city, jusho_db):
+def _search_with_city_match(town_clean, pref, city, jusho_db, strict=False,
+                            prefer_chome=False, rest="", num=None, num2=None):
     results = jusho_db.search_addresses(town_clean)
     city_variants = _build_city_variants(city)
 
@@ -156,20 +308,23 @@ def _search_with_city_match(town_clean, pref, city, jusho_db):
             if exact_match is None:
                 exact_match = zipcode
         # 「（その他）」= 小字を特定できない場合の代表郵便番号
-        elif f" {town_clean}\uff08\u305d\u306e\u4ed6\uff09" in addr_str:
+        elif f" {town_clean}（その他）" in addr_str:
             if sonota_match is None:
                 sonota_match = zipcode
         # 町名の直後が全角括弧 = 小字・丁目範囲付き（その他が無い場合の候補）
-        elif f" {town_clean}\uff08" in addr_str:
+        elif f" {town_clean}（" in addr_str:
             if subarea_match is None:
                 subarea_match = zipcode
         if best_match is None:
             best_match = zipcode
 
+    if strict:
+        return exact_match or sonota_match or subarea_match
     return exact_match or sonota_match or subarea_match or best_match
 
 
-def _posuto_city_match(town_clean, pref, city, conn):
+def _posuto_city_match(town_clean, pref, city, conn, strict=False,
+                       prefer_chome=False, rest="", num=None, num2=None):
     rows = conn.execute(
         "SELECT code, city, neighborhood, data FROM postal_data "
         "WHERE prefecture = ? AND neighborhood LIKE ?",
@@ -177,9 +332,8 @@ def _posuto_city_match(town_clean, pref, city, conn):
     ).fetchall()
     city_variants = _build_city_variants(city)
 
-    exact_full = None    # 町名完全一致かつ非分割（その町域＝単一郵便番号の確定値）
-    sonota_match = None   # koazabanchi=true =「（その他）」相当の代表郵便番号
-    exact_partial = None  # 町名完全一致だが小字/丁目で分割
+    exact_ranked = []     # 町名完全一致。注記との整合度で選ぶ
+    suffix_match = None   # 町名＋「町/村」で一致（例: 礒野東 → 礒野東町）
     subarea_match = None
     best_match = None
     for code, rcity, neighborhood, data in rows:
@@ -191,21 +345,28 @@ def _posuto_city_match(town_clean, pref, city, conn):
         if not city_matched:
             continue
         if neighborhood == town_clean:
-            if '"koazabanchi": true' in data:
-                if sonota_match is None:
-                    sonota_match = code
-            elif '"partial": false' in data:
-                if exact_full is None:
-                    exact_full = code
-            elif exact_partial is None:
-                exact_partial = code
+            info = json.loads(data)
+            # 非分割（partial=false）はその町域＝単一の郵便番号なので信頼度が高い
+            exact_ranked.append((
+                _note_rank(info.get("note"), rest, prefer_chome, num, num2),
+                0 if info.get("partial") else 1,
+                code,
+            ))
+        elif neighborhood in (town_clean + "町", town_clean + "村"):
+            if suffix_match is None:
+                suffix_match = code
         elif neighborhood.startswith(town_clean):
             if subarea_match is None:
                 subarea_match = code
         if best_match is None:
             best_match = code
 
-    return exact_full or sonota_match or exact_partial or subarea_match or best_match
+    # 同じ町名に複数の郵便番号がある場合は注記との整合度が最も高いものを採る
+    # （例: 交野市寺 = 576-0063「丁目」/ 576-0006「番地」）
+    exact_match = max(exact_ranked)[2] if exact_ranked else None
+    if strict:
+        return exact_match or suffix_match
+    return exact_match or suffix_match or subarea_match or best_match
 
 
 def _find_zipcode(address, search_fn):
@@ -249,6 +410,10 @@ def _find_zipcode(address, search_fn):
                 continue
 
             base_towns = []
+            # 連番町名（北16条西 等）は数字を含むため最優先で試す
+            rest = addr[m.end(2):]
+            jo_candidates = _jo_town_candidates(rest)
+            base_towns.extend(jo_candidates)
             if town_clean:
                 base_towns.append(town_clean)
             # 元の町名（末尾の丁目等を除去する前）も試す（例: 六番丁）
@@ -268,36 +433,60 @@ def _find_zipcode(address, search_fn):
             if "字" in town_clean:
                 base_towns.append(town_clean.replace("大字", "").replace("字", ""))
                 aza_split = [p for p in re.split(r"大字|字", town_clean) if p]
+                # 先頭からの累積結合を長い順に試す
+                # （例: 一箕町/八幡/八幡 → 一箕町八幡八幡、一箕町八幡、一箕町）
+                for k in range(len(aza_split), 0, -1):
+                    base_towns.append("".join(aza_split[:k]))
                 base_towns.extend(aza_split)
             # 京都の通り名住所（例: 壬生通八条下ル東寺町 → 東寺町）
             kyoto_split = re.split(r"(?:上る|下る|上ル|下ル|東入る|西入る|東入ル|西入ル|東入|西入)", town_clean)
             if len(kyoto_split) > 1 and kyoto_split[-1]:
                 base_towns.append(kyoto_split[-1])
-            # 「町」境界での区切り（例: 明大寺町伝馬 → 明大寺町）
-            machi_match = re.match(r"^(.+?町)", town_clean)
-            if machi_match and machi_match.group(1) != town_clean:
-                base_towns.append(machi_match.group(1))
+            # 複合地名のフォールバック: 末尾から1文字ずつ短縮（例: 西今宿阿弥陀寺 → 西今宿）
+            # 「町」境界での区切り（例: 明大寺町伝馬 → 明大寺町）もこの短縮で網羅される
+            for cut in range(len(town_clean) - 1, 1, -1):
+                base_towns.append(town_clean[:cut])
             # 末尾「町」の除去（例: 佐藤町 → 佐藤）
             if town_clean.endswith("町") and len(town_clean) > 2:
                 base_towns.append(town_clean[:-1])
-            # 複合地名のフォールバック: 末尾から1文字ずつ短縮（例: 西今宿阿弥陀寺 → 西今宿）
-            for cut in range(len(town_clean) - 1, 1, -1):
-                base_towns.append(town_clean[:cut])
             # 最終手段: 先頭の余分な1〜2文字を除去（例: 元データ誤記「立柏の森」→「柏の森」）
             for drop in (1, 2):
                 if len(town_clean) - drop >= 2:
                     base_towns.append(town_clean[drop:])
 
-            seen = set()
-            for base in base_towns:
-                for tv in _char_variants(base):
-                    for dv in _digit_variants(tv):
-                        if dv in seen or not dv:
-                            continue
-                        seen.add(dv)
-                        result = search_fn(dv, pref, city)
-                        if result:
-                            return result
+            # 町名の直後の数字が丁目とみなせる大きさなら丁目表記と判定する。
+            # （例: 寺3-20-1 → 3丁目 / 越ヶ谷2788-1 → 番地）
+            # 短縮して得た候補（小字を落とした後）は丁目表記とはしない
+            rest_half = _to_half(rest)
+            first_num, first_num2 = _first_nums(rest_half)
+            chome_style = _is_chome_style(rest)
+            jo_set = set(jo_candidates)
+            # 連番町名では条の数字の後ろに丁目が来る（例: 北16条西2 → 2丁目）
+            jo_m = re.match(r"^[^\d]{1,8}?\d{1,2}\s*条?\s*[東西南北]?", rest_half)
+            jo_num, jo_num2 = (_first_nums(rest_half[jo_m.end():]) if jo_m
+                               else (None, None))
+
+            # 1周目は町名が完全一致する候補のみ採用し、2周目で前方一致等を許容する。
+            # 短縮した町名が別町域に前方一致してしまうのを防ぐ（例: 長良小山田 →
+            # 「長良小」が長良小松町に一致するより先に「長良」の完全一致を採る）
+            for strict in (True, False):
+                seen = set()
+                for base in base_towns:
+                    is_jo = base in jo_set
+                    prefer_chome = is_jo or (
+                        chome_style and base in (town_clean, raw_town)
+                    )
+                    num = jo_num if is_jo else first_num
+                    num2 = jo_num2 if is_jo else first_num2
+                    for tv in _char_variants(base):
+                        for dv in _digit_variants(tv):
+                            if dv in seen or not dv:
+                                continue
+                            seen.add(dv)
+                            result = search_fn(dv, pref, city, strict,
+                                               prefer_chome, rest, num, num2)
+                            if result:
+                                return result
     return ""
 
 
@@ -305,13 +494,23 @@ def address_to_zipcode(address, jusho_db, posuto_conn=None):
     # 常に最新の日本郵便KEN_ALL（posuto）を主データ源として優先
     if posuto_conn is not None:
         result = _find_zipcode(
-            address, lambda dv, pref, city: _posuto_city_match(dv, pref, city, posuto_conn)
+            address,
+            lambda dv, pref, city, strict, prefer_chome, rest, num, num2:
+                _posuto_city_match(
+                    dv, pref, city, posuto_conn, strict, prefer_chome,
+                    rest, num, num2
+                ),
         )
         if result:
             return result
     # posutoで見つからない場合のみ jusho（旧DB）にフォールバック
     return _find_zipcode(
-        address, lambda dv, pref, city: _search_with_city_match(dv, pref, city, jusho_db)
+        address,
+        lambda dv, pref, city, strict, prefer_chome, rest, num, num2:
+            _search_with_city_match(
+                dv, pref, city, jusho_db, strict, prefer_chome,
+                rest, num, num2
+            ),
     )
 
 
