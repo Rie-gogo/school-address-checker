@@ -336,6 +336,8 @@ def _posuto_city_match(town_clean, pref, city, conn, strict=False,
     suffix_match = None   # 町名＋「町/村」で一致（例: 礒野東 → 礒野東町）
     subarea_match = None
     best_match = None
+    ward_relaxed = None   # 同一市内の別の区で町名が完全一致（区の表記差を吸収）
+    shi_m = re.match(r"^(.+?市)", city)
     for code, rcity, neighborhood, data in rows:
         city_matched = any(cv in rcity for cv in city_variants)
         if not city_matched:
@@ -343,6 +345,10 @@ def _posuto_city_match(town_clean, pref, city, conn, strict=False,
             if city_parts and all(part in rcity for part in city_parts):
                 city_matched = True
         if not city_matched:
+            if (shi_m and neighborhood == town_clean
+                    and rcity.startswith(shi_m.group(1))
+                    and ward_relaxed is None):
+                ward_relaxed = code
             continue
         if neighborhood == town_clean:
             info = json.loads(data)
@@ -366,7 +372,8 @@ def _posuto_city_match(town_clean, pref, city, conn, strict=False,
     exact_match = max(exact_ranked)[2] if exact_ranked else None
     if strict:
         return exact_match or suffix_match
-    return exact_match or suffix_match or subarea_match or best_match
+    return (exact_match or suffix_match or subarea_match or ward_relaxed
+            or best_match)
 
 
 def _find_zipcode(address, search_fn):
