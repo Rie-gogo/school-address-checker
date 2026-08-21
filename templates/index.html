@@ -260,6 +260,8 @@
         let currentJobId = null;
         let downloadBlobUrl = null;
         let downloadFilename = 'processed.xlsx';
+        let pollFailures = 0;
+        const MAX_POLL_FAILURES = 40;
 
         uploadArea.addEventListener('click', () => fileInput.click());
         uploadArea.addEventListener('dragover', (e) => {
@@ -324,6 +326,7 @@
                 }
 
                 currentJobId = data.job_id;
+                pollFailures = 0;
                 progressSection.classList.add('active');
                 processBtn.textContent = '処理中...';
                 pollStatus();
@@ -338,8 +341,10 @@
             if (!currentJobId) return;
 
             try {
-                const res = await fetch(`/status/${currentJobId}`);
+                const res = await fetch(`/status/${currentJobId}`, { cache: 'no-store' });
+                if (!res.ok) throw new Error('server ' + res.status);
                 const data = await res.json();
+                pollFailures = 0;
 
                 if (data.status === 'processing' || data.status === 'queued') {
                     const pct = data.total > 0 ? (data.progress / data.total * 100) : 0;
@@ -364,13 +369,29 @@
                     // こうすることで、しばらく放置してサーバーがスリープしても
                     // ダウンロードがブラウザのメモリから確実に行える。
                     prepareDownload(data.total);
-                } else if (data.status === 'error') {
-                    showError('処理中にエラーが発生しました: ' + data.error);
+                } else if (data.status === 'error' || data.status === 'lost') {
+                    progressSection.classList.remove('active');
+                    showError(data.status === 'lost'
+                        ? data.error
+                        : '処理中にエラーが発生しました: ' + data.error);
                     processBtn.textContent = '処理を開始する';
                     processBtn.disabled = false;
+                } else {
+                    // 想定外の応答。通信不良と同じ扱いで再試行する。
+                    throw new Error('unexpected response');
                 }
             } catch (err) {
-                showError('ステータス確認に失敗しました: ' + err.message);
+                // サーバーがスリープ／再起動中は一時的に応答しない。
+                // すぐ諦めずに再試行し、それでも復帰しない場合のみエラー表示する。
+                pollFailures++;
+                if (pollFailures <= MAX_POLL_FAILURES) {
+                    progressLabel.textContent = 'サーバーの応答を待っています... (' + pollFailures + ')';
+                    setTimeout(pollStatus, 3000);
+                    return;
+                }
+                progressSection.classList.remove('active');
+                showError('サーバーに接続できないため、処理状況を確認できませんでした。'
+                    + 'お手数ですが、ページを再読み込みしてもう一度アップロードしてください。');
                 processBtn.textContent = '処理を開始する';
                 processBtn.disabled = false;
             }

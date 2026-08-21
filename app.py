@@ -514,6 +514,31 @@ def address_to_zipcode(address, jusho_db, posuto_conn=None):
     )
 
 
+def _meta_path(job_id):
+    return os.path.join(app.config["RESULT_FOLDER"], f"{job_id}_meta.json")
+
+
+def _write_job_meta(job_id, total, original_filename):
+    """完了した処理の情報をディスクに残し、再起動後も結果を返せるようにする。"""
+    try:
+        with open(_meta_path(job_id), "w", encoding="utf-8") as fp:
+            json.dump(
+                {"total": total, "original_filename": original_filename},
+                fp,
+                ensure_ascii=False,
+            )
+    except OSError:
+        pass
+
+
+def _read_job_meta(job_id):
+    try:
+        with open(_meta_path(job_id), encoding="utf-8") as fp:
+            return json.load(fp)
+    except (OSError, ValueError):
+        return None
+
+
 def process_excel(job_id, input_path, output_path):
     try:
         jobs[job_id]["status"] = "processing"
@@ -546,6 +571,7 @@ def process_excel(job_id, input_path, output_path):
             jobs[job_id]["current_school"] = school_name or ""
 
         wb.save(output_path)
+        _write_job_meta(job_id, total, jobs[job_id].get("original_filename", ""))
         jobs[job_id]["status"] = "done"
         jobs[job_id]["progress"] = total
 
@@ -591,7 +617,28 @@ def upload():
 @app.route("/status/<job_id>")
 def status(job_id):
     if job_id not in jobs:
-        return jsonify({"error": "ジョブが見つかりません"}), 404
+        # jobs はプロセス内メモリのため、ワーカー再起動などで失われることがある。
+        # 完了済みならディスクの結果から復元する。
+        output_path = os.path.join(
+            app.config["RESULT_FOLDER"], f"{job_id}_output.xlsx"
+        )
+        meta = _read_job_meta(job_id)
+        if meta is not None and os.path.exists(output_path):
+            return jsonify({
+                "status": "done",
+                "progress": meta["total"],
+                "total": meta["total"],
+                "current_school": "",
+                "error": "",
+            })
+        return jsonify({
+            "status": "lost",
+            "progress": 0,
+            "total": 0,
+            "current_school": "",
+            "error": "サーバーが再起動したため処理が中断されました。"
+                     "お手数ですが、もう一度アップロードしてください。",
+        })
     job = jobs[job_id]
     return jsonify({
         "status": job["status"],
@@ -617,6 +664,14 @@ def download(job_id):
         output_path = job["output_path"]
         original = job.get("original_filename", "output.xlsx")
     else:
+        meta = _read_job_meta(job_id)
+        if meta is not None and os.path.exists(default_path):
+            name = meta.get("original_filename") or "output.xlsx"
+            return send_file(
+                default_path,
+                as_attachment=True,
+                download_name=f"{os.path.splitext(name)[0]}_processed.xlsx",
+            )
         if not os.path.exists(default_path):
             return jsonify({
                 "error": "時間が経過したため処理結果が失われました。"
